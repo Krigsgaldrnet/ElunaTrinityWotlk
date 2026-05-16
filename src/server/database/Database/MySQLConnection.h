@@ -113,6 +113,9 @@ class TC_DATABASE_API MySQLConnection
         ConnectionFlags       m_connectionFlags;            //! Connection flags (for preparing relevant statements)
         std::mutex            m_Mutex;
 
+        uint32                m_effectiveServerVersion;     //! Real server version (for MariaDB compatibility)
+        bool                  m_isMariaDB;                  //! Whether the server is MariaDB
+
         MySQLConnection(MySQLConnection const& right) = delete;
         MySQLConnection& operator=(MySQLConnection const& right) = delete;
 };
