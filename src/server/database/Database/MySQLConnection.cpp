@@ -30,6 +30,49 @@
 #include "MySQLWorkaround.h"
 #include <mysqld_error.h>
 
+static uint32 GetEffectiveServerVersion(MYSQL* mysql)
+{
+    const char* versionString = mysql_get_server_info(mysql);
+    if (!versionString)
+        return mysql_get_server_version(mysql);
+
+    std::string_view sv(versionString);
+
+    // Check if it's MariaDB
+    if (sv.find("MariaDB") != std::string_view::npos)
+    {
+        // Typical format: "5.5.5-10.11.14-MariaDB" or "10.11.14-MariaDB"
+        // Find the part after the first '-' and before "-MariaDB"
+        size_t dashPos = sv.find('-');
+        if (dashPos != std::string_view::npos)
+        {
+            size_t mariaPos = sv.find("MariaDB");
+            if (mariaPos != std::string_view::npos)
+            {
+                std::string_view versionPart = sv.substr(dashPos + 1, mariaPos - dashPos - 1);
+                // Remove any trailing dash or dot
+                while (!versionPart.empty() && (versionPart.back() == '-' || versionPart.back() == '.'))
+                    versionPart.remove_suffix(1);
+
+                // Parse major.minor.patch
+                uint32 major = 0, minor = 0, patch = 0;
+                if (sscanf(versionPart.data(), "%u.%u.%u", &major, &minor, &patch) >= 2)
+                {
+                    // Encode as MMmmpp (MariaDB 10.11.14 -> 101114)
+                    return major * 10000 + minor * 100 + patch;
+                }
+            }
+        }
+        // Fallback: try to parse the whole string as X.Y.Z (some MariaDB versions don't use the fake prefix)
+        uint32 major = 0, minor = 0, patch = 0;
+        if (sscanf(versionString, "%u.%u.%u", &major, &minor, &patch) >= 2)
+            return major * 10000 + minor * 100 + patch;
+    }
+
+    // For standard MySQL, use the built-in function
+    return mysql_get_server_version(mysql);
+}
+
 MySQLConnectionInfo::MySQLConnectionInfo(std::string const& infoString)
 {
     std::vector<std::string_view> tokens = Trinity::Tokenize(infoString, ';', true);
@@ -53,7 +96,9 @@ m_prepareError(false),
 m_queue(nullptr),
 m_Mysql(nullptr),
 m_connectionInfo(connInfo),
-m_connectionFlags(CONNECTION_SYNCH) { }
+m_connectionFlags(CONNECTION_SYNCH),
+m_effectiveServerVersion(0),
+m_isMariaDB(false) { }
 
 MySQLConnection::MySQLConnection(ProducerConsumerQueue<SQLOperation*>* queue, MySQLConnectionInfo& connInfo) :
 m_reconnecting(false),
@@ -61,7 +106,9 @@ m_prepareError(false),
 m_queue(queue),
 m_Mysql(nullptr),
 m_connectionInfo(connInfo),
-m_connectionFlags(CONNECTION_ASYNC)
+m_connectionFlags(CONNECTION_ASYNC),
+m_effectiveServerVersion(0),
+m_isMariaDB(false)
 {
     m_worker = std::make_unique<DatabaseWorker>(m_queue, this);
 }
@@ -164,10 +211,12 @@ uint32 MySQLConnection::Open()
         }
 
         TC_LOG_INFO("sql.sql", "Connected to MySQL database at {}", m_connectionInfo.host);
-        mysql_autocommit(m_Mysql, 1);
 
-        // set connection properties to UTF8 to properly handle locales for different
-        // server configs - core sends data in UTF8, so MySQL must expect UTF8 too
+        // Store effective server version (handles MariaDB fake version strings)
+        m_effectiveServerVersion = GetEffectiveServerVersion(m_Mysql);
+        m_isMariaDB = (m_effectiveServerVersion != mysql_get_server_version(m_Mysql));
+
+        mysql_autocommit(m_Mysql, 1);
         mysql_set_character_set(m_Mysql, "utf8mb4");
         return 0;
     }
@@ -464,7 +513,8 @@ void MySQLConnection::Unlock()
 
 uint32 MySQLConnection::GetServerVersion() const
 {
-    return mysql_get_server_version(m_Mysql);
+    // Return cached effective version if we have it, otherwise fallback to the original method
+    return m_effectiveServerVersion ? m_effectiveServerVersion : mysql_get_server_version(m_Mysql);
 }
 
 MySQLPreparedStatement* MySQLConnection::GetPreparedStatement(uint32 index)
